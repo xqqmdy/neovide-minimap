@@ -9,29 +9,25 @@ local is_syncing = false
 local FONT_SCALE = 0.35
 local MINIMAP_WIDTH = 60 -- logical columns; scaled to ~21 cell widths on screen
 
-local function grid_win_handle(win)
+local function apply_font_scale(win)
   if not win or not vim.api.nvim_win_is_valid(win) then
-    return nil
-  end
-  local prev = vim.api.nvim_get_current_win()
-  local ok = pcall(vim.api.nvim_set_current_win, win)
-  if not ok then
-    return nil
-  end
-  local handle = vim.fn.win_getid()
-  pcall(vim.api.nvim_set_current_win, prev)
-  return handle
-end
-
-local function send_font_scale(window_handle)
-  local channel_id = vim.g.neovide_channel_id
-  if not channel_id then
     return
   end
-  if not window_handle then
-    return
+  -- Neovide reads this window-local variable on every win_float_pos event;
+  -- plain nvim / upstream Neovide ignore it.
+  vim.w[win].neovide_font_scale = FONT_SCALE
+  -- Force a win_float_pos event so Neovide picks the scale up immediately
+  -- (it may have queried the variable before we set it).
+  local ok, cfg = pcall(vim.api.nvim_win_get_config, win)
+  if ok then
+    pcall(vim.api.nvim_win_set_config, win, {
+      relative = cfg.relative,
+      row = cfg.row,
+      col = cfg.col,
+      width = cfg.width,
+      height = cfg.height,
+    })
   end
-  vim.fn.rpcnotify(channel_id, "neovide.set_grid_font_scale", window_handle, FONT_SCALE)
 end
 
 -- Create minimap window
@@ -96,16 +92,15 @@ function M.create_minimap()
   vim.wo[minimap_win].spell = false
   vim.wo[minimap_win].winhighlight = "Normal:NormalFloat"
 
-  -- Send font scale; retry a few times so it lands after the grid is registered.
-  local window_handle = grid_win_handle(minimap_win)
-  send_font_scale(window_handle)
-  for _, delay in ipairs({ 50, 100, 200, 500, 1000 }) do
-    vim.defer_fn(function()
-      if minimap_win and vim.api.nvim_win_is_valid(minimap_win) then
-        send_font_scale(window_handle)
-      end
-    end, delay)
-  end
+  -- Set the font scale immediately after creation so Neovide's first
+  -- win_float_pos event for this window already carries it.
+  apply_font_scale(minimap_win)
+  -- Re-apply shortly after in case of race with the first redraw.
+  vim.defer_fn(function()
+    if minimap_win and vim.api.nvim_win_is_valid(minimap_win) then
+      apply_font_scale(minimap_win)
+    end
+  end, 50)
 
   -- Syntax highlighting: attach treesitter if a parser exists for the filetype.
   local ok_ts = pcall(vim.treesitter.start, minimap_buf, source_ft)
@@ -166,10 +161,6 @@ function M.create_minimap()
               -- (~screen_rows/0.35) exceeds mid-file lines, so Neovim thinks
               -- they're visible.
               if minimap_win and vim.api.nvim_win_is_valid(minimap_win) then
-                local dbg = io.open("C:/Users/xqqmdy/AppData/Local/Temp/minimap_dbg.log", "a")
-                local before = vim.api.nvim_win_call(minimap_win, function()
-                  return vim.fn.winsaveview().topline
-                end)
                 pcall(vim.api.nvim_win_call, minimap_win, function()
                   -- Center the clicked line in the VISIBLE area. The float's
                   -- logical height is screen_rows/0.35 (~112) but only
@@ -187,13 +178,6 @@ function M.create_minimap()
                   pcall(vim.fn.winrestview, { topline = top, lnum = line, col = 0 })
                   vim.wo[minimap_win].scrolloff = prev_so
                 end)
-                local after = vim.api.nvim_win_call(minimap_win, function()
-                  return vim.fn.winsaveview().topline
-                end)
-                if dbg then
-                  dbg:write(string.format("click line=%d mm_top before=%d after=%d\n", line, before, after))
-                  dbg:close()
-                end
               end
               -- Refresh the minimap viewport highlight while clicking/dragging
               -- (do NOT call sync_scroll: it moves the minimap cursor and
@@ -338,11 +322,8 @@ function M.reposition()
   })
 
   -- Re-assert the font scale in case the grid was recreated on resize.
-  -- The window may have been closed/rebuild by another WinResized handler
-  -- between the check above and here, so re-validate before touching it.
   if minimap_win and vim.api.nvim_win_is_valid(minimap_win) then
-    local window_handle = grid_win_handle(minimap_win)
-    send_font_scale(window_handle)
+    apply_font_scale(minimap_win)
     M.sync_scroll()
   end
 end
@@ -414,6 +395,12 @@ function M.update_viewport_highlight(cursor_line)
   if not minimap_buf or not vim.api.nvim_buf_is_valid(minimap_buf) then
     return
   end
+  -- source_win may be stale (e.g. closed right before this CursorMoved
+  -- callback runs); every nvim_win_* call below needs it valid.
+  if not source_win or not vim.api.nvim_win_is_valid(source_win)
+    or not minimap_win or not vim.api.nvim_win_is_valid(minimap_win) then
+    return
+  end
   cursor_line = cursor_line or 1
 
   if vim.fn.hlexists("MinimapViewport") == 0 then
@@ -455,6 +442,12 @@ end
 -- 2. cursor-nearby lines get a semi-transparent overlay, full minimap width
 --    (VS Code style viewport highlight), driven by Neovide's blend attr.
 function M.sync_scroll()
+  if not source_win or not vim.api.nvim_win_is_valid(source_win)
+    or not minimap_win or not vim.api.nvim_win_is_valid(minimap_win)
+    or not source_buf or not vim.api.nvim_buf_is_valid(source_buf)
+    or not minimap_buf or not vim.api.nvim_buf_is_valid(minimap_buf) then
+    return
+  end
   if not minimap_win or not vim.api.nvim_win_is_valid(minimap_win) then
     return
   end
@@ -499,7 +492,6 @@ end
 
 -- Keybindings
 vim.keymap.set("n", "<leader>mm", M.toggle, { desc = "Toggle Minimap" })
-vim.keymap.set("n", "<leader>mc", M.close_minimap, { desc = "Close Minimap" })
 
 -- Auto-open the minimap as soon as Neovide starts. No deferred delay: by
 -- VimEnter all lazy=false plugins have loaded, and the font-scale race
